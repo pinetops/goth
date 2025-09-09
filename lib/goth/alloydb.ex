@@ -14,33 +14,48 @@ defmodule Goth.AlloyDB do
       # Basic token fetching
       {:ok, token} = Goth.AlloyDB.get_token(MyApp.Goth)
 
-      # IAM authentication (default)
+      # IAM authentication (verbose form)
       config = Goth.AlloyDB.postgrex_config(
         goth_name: MyApp.Goth,
+        hostname: "10.0.0.1",
+        database: "postgres",
+        username: "user@example.com",
+        project_id: "my-project",
+        location: "us-central1",
+        cluster: "my-cluster"
+      )
+      {:ok, conn} = Postgrex.start_link(config)
+
+      # With cluster configuration (recommended)
+      # config/config.exs
+      config :goth_alloydb, :clusters,
+        prod: [
+          project_id: "prod-project",
+          location: "us-central1", 
+          cluster: "prod-cluster"
+        ]
+
+      # Clean usage with cluster config
+      config = Goth.AlloyDB.postgrex_config(
+        goth_name: MyApp.Goth,
+        cluster_config: :prod,
         hostname: "10.0.0.1",
         database: "postgres",
         username: "user@example.com"
       )
       {:ok, conn} = Postgrex.start_link(config)
 
-      # Native database authentication  
-      config = Goth.AlloyDB.postgrex_config(
-        goth_name: MyApp.Goth,
-        hostname: "10.0.0.1",
-        database: "postgres",
-        username: "dbuser",
-        password: "dbpassword",
-        auth_mode: :native
-      )
-      {:ok, conn} = Postgrex.start_link(config)
-
-      # For use with config_resolver pattern
-      resolver = &Goth.AlloyDB.config_resolver/1
-      {:ok, conn} = Postgrex.start_link([
-        hostname: "10.0.0.1",
-        database: "postgres", 
-        config_resolver: resolver
-      ])
+      # Config resolver pattern (cleanest for supervision trees)
+      children = [
+        {Goth, name: MyApp.Goth, source: {:metadata, []}},
+        
+        {Postgrex,
+         hostname: "10.0.0.1",
+         database: "postgres",
+         cluster_config: :prod,
+         goth_server: MyApp.Goth,                        # ← Consistent with other Goth usage
+         config_resolver: &Goth.AlloyDB.config_resolver/1}
+      ]
 
   ## AlloyDB Authentication Modes
 
@@ -99,6 +114,7 @@ defmodule Goth.AlloyDB do
 
   require Logger
   alias Goth.Token
+
 
   @default_scopes ["https://www.googleapis.com/auth/cloud-platform"]
   @cert_cache_table :goth_alloydb_cert_cache
@@ -313,7 +329,9 @@ defmodule Goth.AlloyDB do
   """
   @spec generate_ssl_config(String.t(), keyword()) :: {:ok, keyword()} | {:error, term()}
   def generate_ssl_config(token, opts) do
-    cache_key = build_cert_cache_key(opts)
+    # Resolve cluster configuration
+    resolved_opts = resolve_cluster_config(opts)
+    cache_key = build_cert_cache_key(resolved_opts)
     
     case get_cached_certificate(cache_key) do
       {:ok, ssl_config} ->
@@ -322,7 +340,7 @@ defmodule Goth.AlloyDB do
         
       :cache_miss ->
         Logger.debug("Generating new AlloyDB certificate")
-        generate_and_cache_ssl_config(token, opts, cache_key)
+        generate_and_cache_ssl_config(token, resolved_opts, cache_key)
     end
   end
 
@@ -331,11 +349,13 @@ defmodule Goth.AlloyDB do
   """
   @spec generate_ssl_config_uncached(String.t(), keyword()) :: {:ok, keyword()} | {:error, term()}
   def generate_ssl_config_uncached(token, opts) do
-    hostname = Keyword.fetch!(opts, :hostname)
+    # Resolve cluster configuration
+    resolved_opts = resolve_cluster_config(opts)
+    hostname = Keyword.fetch!(resolved_opts, :hostname)
     
     with {private_pem, public_pem} <- generate_rsa_keypair(),
          true <- validate_rsa_keypair(private_pem, public_pem),
-         {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
+         {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, resolved_opts) do
       
       # Parse certificates for in-memory use
       {client_cert_der, key_tuple, ca_cert_der} = parse_ssl_cert_and_key(hd(cert_chain), private_pem, ca_cert)
@@ -400,13 +420,16 @@ defmodule Goth.AlloyDB do
   """
   @spec postgrex_config(keyword()) :: keyword()
   def postgrex_config(opts) do
-    goth_name = Keyword.fetch!(opts, :goth_name)
-    hostname = Keyword.fetch!(opts, :hostname)
-    database = Keyword.fetch!(opts, :database)
-    username = Keyword.fetch!(opts, :username)
-    port = Keyword.get(opts, :port, 5432)
-    timeout = Keyword.get(opts, :timeout, 15000)
-    auth_mode = Keyword.get(opts, :auth_mode, :iam)
+    # Resolve cluster configuration first
+    resolved_opts = resolve_cluster_config(opts)
+    
+    goth_name = Keyword.fetch!(resolved_opts, :goth_name)
+    hostname = Keyword.fetch!(resolved_opts, :hostname)
+    database = Keyword.fetch!(resolved_opts, :database)
+    username = Keyword.fetch!(resolved_opts, :username)
+    port = Keyword.get(resolved_opts, :port, 5432)
+    timeout = Keyword.get(resolved_opts, :timeout, 15000)
+    auth_mode = Keyword.get(resolved_opts, :auth_mode, :iam)
     
     # Validate auth_mode
     unless auth_mode in [:iam, :native] do
@@ -415,7 +438,7 @@ defmodule Goth.AlloyDB do
     
     # Get OAuth token for certificate generation
     token = get_token!(goth_name)
-    {:ok, ssl_config} = generate_ssl_config(token, opts)
+    {:ok, ssl_config} = generate_ssl_config(token, resolved_opts)
     
     # Determine password based on auth mode
     password = case auth_mode do
@@ -424,7 +447,7 @@ defmodule Goth.AlloyDB do
         token
       :native ->
         # Native mode: provided password
-        case Keyword.get(opts, :password) do
+        case Keyword.get(resolved_opts, :password) do
           nil ->
             raise ArgumentError, "Password is required for :native auth_mode"
           password ->
@@ -454,19 +477,13 @@ defmodule Goth.AlloyDB do
 
   ## Usage
 
-      # IAM authentication (default)
-      config = [
-        hostname: "10.0.0.1",
-        database: "postgres",
-        config_resolver: &Goth.AlloyDB.config_resolver/1
-      ]
-
-      # Native database authentication
-      config = [
-        hostname: "10.0.0.1", 
-        database: "postgres",
-        auth_mode: :native,
-        config_resolver: &Goth.AlloyDB.config_resolver/1
+      children = [
+        {Postgrex,
+         hostname: "10.0.0.1",
+         database: "postgres",
+         cluster_config: :prod,
+         goth_server: MyApp.Goth,
+         config_resolver: &Goth.AlloyDB.config_resolver/1}
       ]
 
       # The resolver will be called with the base options and should
@@ -474,12 +491,16 @@ defmodule Goth.AlloyDB do
   """
   @spec config_resolver(keyword()) :: keyword()
   def config_resolver(opts) do
-    # Extract required options from application config or opts
-    goth_name = get_required_opt(opts, :goth_name, "GOTH_SERVER_NAME")
-    project_id = get_required_opt(opts, :project_id, "ALLOYDB_PROJECT_ID")
-    location = get_required_opt(opts, :location, "ALLOYDB_LOCATION")
-    cluster = get_required_opt(opts, :cluster, "ALLOYDB_CLUSTER")
-    auth_mode = Keyword.get(opts, :auth_mode, :iam)
+    # Resolve cluster configuration first
+    resolved_opts = resolve_cluster_config(opts)
+    
+    # Extract Goth server from connection options (consistent with other Goth usage)
+    goth_server = Keyword.fetch!(resolved_opts, :goth_server)
+    
+    project_id = get_required_opt(resolved_opts, :project_id, "ALLOYDB_PROJECT_ID")
+    location = get_required_opt(resolved_opts, :location, "ALLOYDB_LOCATION")
+    cluster = get_required_opt(resolved_opts, :cluster, "ALLOYDB_CLUSTER")
+    auth_mode = Keyword.get(resolved_opts, :auth_mode, :iam)
     
     # Validate auth_mode
     unless auth_mode in [:iam, :native] do
@@ -487,13 +508,13 @@ defmodule Goth.AlloyDB do
     end
     
     # Generate fresh OAuth token for certificate generation
-    token = get_token!(goth_name)
+    token = get_token!(goth_server)
     
     ssl_opts = [
       project_id: project_id,
       location: location,
       cluster: cluster,
-      hostname: opts[:hostname]
+      hostname: resolved_opts[:hostname]
     ]
     
     case generate_ssl_config(token, ssl_opts) do
@@ -502,12 +523,12 @@ defmodule Goth.AlloyDB do
         {username, password} = case auth_mode do
           :iam ->
             # IAM mode: OAuth token as password
-            username = get_required_opt(opts, :username, "ALLOYDB_IAM_USER")
+            username = get_required_opt(resolved_opts, :username, "ALLOYDB_IAM_USER")
             {username, token}
           :native ->
             # Native mode: provided credentials
-            username = get_required_opt(opts, :username, "ALLOYDB_DB_USER")
-            password = get_required_opt(opts, :password, "ALLOYDB_DB_PASSWORD")
+            username = get_required_opt(resolved_opts, :username, "ALLOYDB_DB_USER")
+            password = get_required_opt(resolved_opts, :password, "ALLOYDB_DB_PASSWORD")
             {username, password}
         end
         
@@ -645,6 +666,24 @@ defmodule Goth.AlloyDB do
   end
 
   # Private functions
+
+  defp resolve_cluster_config(opts) do
+    case Keyword.get(opts, :cluster_config) do
+      nil ->
+        # No cluster_config specified, expect individual parameters
+        opts
+      cluster_name ->
+        # Look up cluster configuration
+        clusters = Application.get_env(:goth_alloydb, :clusters, %{})
+        case Map.get(clusters, cluster_name) do
+          nil ->
+            raise ArgumentError, "Unknown cluster_config: #{inspect(cluster_name)}. Available: #{inspect(Map.keys(clusters))}"
+          cluster_opts ->
+            # Merge cluster config with opts, opts take precedence
+            Keyword.merge(cluster_opts, Keyword.delete(opts, :cluster_config))
+        end
+    end
+  end
 
   defp build_cert_cache_key(opts) do
     # Build cache key from AlloyDB instance identity
