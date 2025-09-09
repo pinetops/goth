@@ -127,10 +127,86 @@ defmodule Goth.AlloyDB do
           location: location,
           cluster: cluster,
           instance: instance,
-          hostname: "127.0.0.1"  # Auth proxy default
+          hostname: "127.0.0.1"  # Auth proxy default - use resolve_instance_uri for actual IP
         }}
       _ ->
         {:error, "Invalid instance URI format. Expected: projects/PROJECT/locations/LOCATION/clusters/CLUSTER/instances/INSTANCE"}
+    end
+  end
+
+  @doc """
+  Resolves an AlloyDB instance URI to actual connection details by calling the AlloyDB Admin API.
+  This is the equivalent of what the Go connector does - it fetches the actual IP address.
+  
+  ## Examples
+  
+      {:ok, components} = AlloyDB.resolve_instance_uri("projects/my-project/locations/us-central1/clusters/prod/instances/primary", token)
+      # => {:ok, %{project_id: "my-project", location: "us-central1", cluster: "prod", instance: "primary", hostname: "10.56.0.2"}}
+      
+      # With public IP
+      {:ok, components} = AlloyDB.resolve_instance_uri(instance_uri, token, ip_type: :public)
+  """
+  @spec resolve_instance_uri(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, String.t()}
+  def resolve_instance_uri(instance_uri, token, opts \\ []) do
+    with {:ok, components} <- parse_instance_uri(instance_uri),
+         {:ok, ip_address} <- get_instance_ip_address(instance_uri, token, opts) do
+      {:ok, Map.put(components, :hostname, ip_address)}
+    end
+  end
+
+  @doc """
+  Calls the AlloyDB Admin API to get instance metadata and extract the IP address.
+  
+  ## Options
+  
+  - `:ip_type` - `:private` (default) or `:public`
+  - `:http_client` - HTTP client to use (default: HTTPoison)
+  
+  ## Examples
+  
+      {:ok, "10.56.0.2"} = AlloyDB.get_instance_ip_address(instance_uri, token)
+      {:ok, "203.0.113.1"} = AlloyDB.get_instance_ip_address(instance_uri, token, ip_type: :public)
+  """
+  @spec get_instance_ip_address(String.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  def get_instance_ip_address(instance_uri, token, opts \\ []) do
+    http_client = Keyword.get(opts, :http_client, HTTPoison)
+    ip_type = Keyword.get(opts, :ip_type, :private)
+    
+    url = "https://alloydb.googleapis.com/v1/#{instance_uri}"
+    headers = [
+      {"Authorization", "Bearer #{token}"},
+      {"Content-Type", "application/json"}
+    ]
+    
+    case http_client.get(url, headers) do
+      {:ok, %{status_code: 200, body: body}} ->
+        case Jason.decode(body) do
+          {:ok, instance_data} ->
+            extract_ip_address(instance_data, ip_type)
+          {:error, reason} ->
+            {:error, "Failed to parse instance metadata: #{inspect(reason)}"}
+        end
+      {:ok, %{status_code: status_code, body: body}} ->
+        {:error, "AlloyDB API request failed: #{status_code} - #{body}"}
+      {:error, reason} ->
+        {:error, "HTTP request failed: #{inspect(reason)}"}
+    end
+  end
+
+  defp extract_ip_address(instance_data, ip_type) do
+    case ip_type do
+      :private ->
+        case Map.get(instance_data, "ipAddress") do
+          nil -> {:error, "Instance does not have a private IP address"}
+          ip_address -> {:ok, ip_address}
+        end
+      :public ->
+        case Map.get(instance_data, "publicIpAddress") do
+          nil -> {:error, "Instance does not have a public IP address"}
+          ip_address -> {:ok, ip_address}
+        end
+      _ ->
+        {:error, "Unsupported IP type: #{ip_type}. Use :private or :public"}
     end
   end
 
@@ -574,7 +650,8 @@ defmodule Goth.AlloyDB do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    # Pass through to Goth.start_link
+    # Add AlloyDB scope if not provided
+    opts = Keyword.put_new(opts, :scope, ["https://www.googleapis.com/auth/cloud-platform"])
     Goth.start_link(opts)
   end
 
@@ -687,8 +764,9 @@ defmodule Goth.AlloyDB do
         # No instance_uri, return opts as-is
         opts
       instance_uri ->
-        # Parse instance_uri and merge with opts
-        case parse_instance_uri(instance_uri) do
+        # Try to resolve actual IP address if we have a token available
+        # Otherwise fall back to Auth Proxy default
+        case try_resolve_instance_uri_with_api(opts, instance_uri) do
           {:ok, components} ->
             opts
             |> Keyword.delete(:instance_uri)
@@ -699,6 +777,41 @@ defmodule Goth.AlloyDB do
           {:error, reason} ->
             raise ArgumentError, reason
         end
+    end
+  end
+
+  defp try_resolve_instance_uri_with_api(opts, instance_uri) do
+    # Try to get token and resolve real IP address
+    case get_token_from_opts(opts) do
+      {:ok, token} ->
+        # Use the public resolve_instance_uri/3 function to get actual IP
+        case resolve_instance_uri(instance_uri, token, opts) do
+          {:ok, components} ->
+            {:ok, components}
+          {:error, _reason} ->
+            # Fall back to parse-only if API call fails
+            parse_instance_uri(instance_uri)
+        end
+      :error ->
+        # No token available, fall back to parse-only
+        parse_instance_uri(instance_uri)
+    end
+  end
+
+  defp get_token_from_opts(opts) do
+    cond do
+      goth_name = Keyword.get(opts, :goth_name) ->
+        case get_token(goth_name) do
+          {:ok, token} -> {:ok, token}
+          _ -> :error
+        end
+      goth_server = Keyword.get(opts, :goth_server) ->
+        case get_token(goth_server) do
+          {:ok, token} -> {:ok, token}
+          _ -> :error
+        end
+      true ->
+        :error
     end
   end
 

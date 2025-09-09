@@ -1,6 +1,5 @@
 defmodule Goth.AlloyDBTest do
   use ExUnit.Case
-  import ExUnit.CaptureLog
 
   alias Goth.AlloyDB
 
@@ -347,8 +346,180 @@ defmodule Goth.AlloyDBTest do
 
   # Test helper functions
 
+  describe "parse_instance_uri/1" do
+    test "parses valid instance URI" do
+      uri = "projects/my-project/locations/us-central1/clusters/prod/instances/primary"
+      
+      assert {:ok, components} = AlloyDB.parse_instance_uri(uri)
+      assert components.project_id == "my-project"
+      assert components.location == "us-central1"
+      assert components.cluster == "prod"
+      assert components.instance == "primary"
+      assert components.hostname == "127.0.0.1"
+    end
+
+    test "handles invalid instance URI format" do
+      invalid_uris = [
+        "invalid/format",
+        "projects/my-project",
+        "projects/my-project/locations/us-central1",
+        "projects/my-project/locations/us-central1/clusters/prod",
+        "wrong/my-project/locations/us-central1/clusters/prod/instances/primary"
+      ]
+
+      for uri <- invalid_uris do
+        assert {:error, error_msg} = AlloyDB.parse_instance_uri(uri)
+        assert String.contains?(error_msg, "Invalid instance URI format")
+      end
+    end
+  end
+
+  describe "resolve_instance_uri/3" do
+    test "resolves instance URI to actual IP address" do
+      uri = "projects/test-project/locations/us-central1/clusters/test-cluster/instances/primary"
+      token = "ya29.test_token"
+      
+      expect_http_get(fn url, headers ->
+        assert url == "https://alloydb.googleapis.com/v1/#{uri}"
+        assert {"Authorization", "Bearer ya29.test_token"} in headers
+        
+        response_body = Jason.encode!(%{
+          "ipAddress" => "10.56.0.2",
+          "publicIpAddress" => "203.0.113.1"
+        })
+        
+        {:ok, %{status_code: 200, body: response_body}}
+      end)
+      
+      assert {:ok, components} = AlloyDB.resolve_instance_uri(uri, token, http_client: MockHTTPClient)
+      assert components.project_id == "test-project"
+      assert components.location == "us-central1" 
+      assert components.cluster == "test-cluster"
+      assert components.instance == "primary"
+      assert components.hostname == "10.56.0.2"  # Actual IP from API!
+    end
+
+    test "resolves to public IP when requested" do
+      uri = "projects/test-project/locations/us-central1/clusters/test-cluster/instances/primary"
+      token = "ya29.test_token"
+      
+      expect_http_get(fn url, headers ->
+        response_body = Jason.encode!(%{
+          "ipAddress" => "10.56.0.2",
+          "publicIpAddress" => "203.0.113.1"
+        })
+        
+        {:ok, %{status_code: 200, body: response_body}}
+      end)
+      
+      assert {:ok, components} = AlloyDB.resolve_instance_uri(uri, token, ip_type: :public, http_client: MockHTTPClient)
+      assert components.hostname == "203.0.113.1"  # Public IP
+    end
+  end
+
+  describe "get_instance_ip_address/3" do
+    test "fetches private IP from AlloyDB Admin API" do
+      uri = "projects/test-project/locations/us-central1/clusters/test-cluster/instances/primary"
+      token = "ya29.test_token"
+      
+      expect_http_get(fn url, headers ->
+        assert url == "https://alloydb.googleapis.com/v1/#{uri}"
+        assert {"Authorization", "Bearer ya29.test_token"} in headers
+        
+        response_body = Jason.encode!(%{
+          "ipAddress" => "10.56.0.2"
+        })
+        
+        {:ok, %{status_code: 200, body: response_body}}
+      end)
+      
+      assert {:ok, "10.56.0.2"} = AlloyDB.get_instance_ip_address(uri, token, http_client: MockHTTPClient)
+    end
+
+    test "fetches public IP when specified" do
+      uri = "projects/test-project/locations/us-central1/clusters/test-cluster/instances/primary"
+      token = "ya29.test_token"
+      
+      expect_http_get(fn url, headers ->
+        response_body = Jason.encode!(%{
+          "ipAddress" => "10.56.0.2",
+          "publicIpAddress" => "203.0.113.1"
+        })
+        
+        {:ok, %{status_code: 200, body: response_body}}
+      end)
+      
+      assert {:ok, "203.0.113.1"} = AlloyDB.get_instance_ip_address(uri, token, ip_type: :public, http_client: MockHTTPClient)
+    end
+  end
+
+  describe "instance URI integration" do
+    test "postgrex_config resolves instance_uri" do
+      expect_goth_fetch(fn :test_server, _timeout ->
+        {:ok, %Goth.Token{token: "test_token", expires: 9999999999}}
+      end)
+
+      expect_http_post(fn _url, _body, _headers ->
+        {:ok, %{
+          status_code: 200,
+          body: Jason.encode!(%{
+            "pemCertificateChain" => ["cert1", "cert2"],
+            "caCert" => "ca_cert"
+          })
+        }}
+      end)
+
+      uri = "projects/test-project/locations/us-central1/clusters/test-cluster/instances/primary"
+      
+      config = AlloyDB.postgrex_config([
+        goth_name: :test_server,
+        instance_uri: uri,
+        database: "postgres",
+        username: "user@example.com"
+      ])
+
+      assert config[:hostname] == "127.0.0.1"  # Auth proxy default
+      assert config[:database] == "postgres"
+      assert config[:username] == "user@example.com"
+      assert config[:password] == "test_token"
+      assert is_list(config[:ssl])
+    end
+
+    test "config_resolver resolves instance_uri" do
+      expect_goth_fetch(fn :test_server, _timeout ->
+        {:ok, %Goth.Token{token: "test_token", expires: 9999999999}}
+      end)
+
+      expect_http_post(fn _url, _body, _headers ->
+        {:ok, %{
+          status_code: 200,
+          body: Jason.encode!(%{
+            "pemCertificateChain" => ["cert1", "cert2"],
+            "caCert" => "ca_cert"
+          })
+        }}
+      end)
+
+      uri = "projects/test-project/locations/us-central1/clusters/test-cluster/instances/primary"
+      
+      opts = [
+        goth_server: :test_server,
+        instance_uri: uri,
+        database: "postgres",
+        username: "user@example.com"
+      ]
+
+      config = AlloyDB.config_resolver(opts)
+
+      assert config[:hostname] == "127.0.0.1"  # Auth proxy default
+      assert config[:database] == "postgres"
+      assert config[:username] == "user@example.com"
+      assert config[:password] == "test_token"
+      assert is_list(config[:ssl])
+    end
+  end
+
   defp expect_goth_fetch(fun) do
-    original_fetch = &Goth.fetch/2
     :meck.new(Goth, [:non_strict])
     :meck.expect(Goth, :fetch, fun)
     
@@ -367,8 +538,17 @@ defmodule Goth.AlloyDBTest do
   end
 
   defp expect_http_post(fun) do
-    :meck.new(MockHTTPClient)
+    :meck.new(MockHTTPClient, [:non_strict])
     :meck.expect(MockHTTPClient, :post, fun)
+    
+    on_exit(fn ->
+      :meck.unload(MockHTTPClient)
+    end)
+  end
+
+  defp expect_http_get(fun) do
+    :meck.new(MockHTTPClient, [:non_strict])
+    :meck.expect(MockHTTPClient, :get, fun)
     
     on_exit(fn ->
       :meck.unload(MockHTTPClient)
@@ -379,4 +559,5 @@ end
 # Mock HTTP client for testing
 defmodule MockHTTPClient do
   def post(_url, _body, _headers), do: {:error, :not_mocked}
+  def get(_url, _headers), do: {:error, :not_mocked}
 end

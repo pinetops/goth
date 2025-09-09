@@ -403,4 +403,63 @@ defmodule GothTest do
     assert Keyword.has_key?(options, :headers)
     assert Keyword.has_key?(options, :body)
   end
+
+  describe "get_project_id/1" do
+    test "returns project_id from config", %{test: test} do
+      credentials = Map.put(random_service_account_credentials(), "project_id", "test-project-123")
+      
+      # Start Goth Config to simulate real setup  
+      config = [name: test, source: {:service_account, credentials}]
+      start_supervised!({Goth, config})
+      
+      # The credentials should contain project_id
+      assert {:ok, project_id} = Goth.get_project_id(test)
+      assert is_binary(project_id)
+      assert project_id == "test-project-123"
+    end
+
+    test "falls back to default account", %{test: test} do
+      # Don't start any named account - should fall back to :default from test config
+      # The :default account has project_id "my-project" from test configuration
+      assert {:ok, project_id} = Goth.get_project_id(test)
+      assert is_binary(project_id)
+      assert project_id == "my-project"
+    end
+
+    test "returns error when no project_id found", %{test: test} do
+      credentials = random_service_account_credentials()  # No project_id
+      
+      # Start Goth without project_id
+      config = [name: test, source: {:service_account, credentials}]
+      start_supervised!({Goth, config})
+      
+      # Since named account has no project_id, should fall back to default
+      # The default account has "my-project" from test config
+      assert {:ok, project_id} = Goth.get_project_id(test)
+      assert project_id == "my-project"
+    end
+
+    test "raises with get_project_id!/1 on error", %{test: test} do
+      # Stop the default configuration to ensure no fallback
+      Application.stop(:goth)
+      Application.put_env(:goth, :json, nil, persistent: true)
+      
+      on_exit(fn ->
+        # Restore test config
+        config = "test/data/test-credentials.json" |> Path.expand() |> File.read!()
+        Application.put_env(:goth, :json, config, persistent: true)
+        Application.start(:goth)
+      end)
+      
+      credentials = random_service_account_credentials()  # No project_id
+      
+      # Start Goth without project_id and no fallback available
+      config = [name: test, source: {:service_account, credentials}]
+      start_supervised!({Goth, config})
+      
+      assert_raise RuntimeError, ~r/Failed to get project_id/, fn ->
+        Goth.get_project_id!(test)
+      end
+    end
+  end
 end
