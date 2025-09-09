@@ -126,15 +126,28 @@ Features:
 - **Postgrex Integration** - Drop-in configuration helpers
 - **Config Resolver Support** - Dynamic credential injection for connection pools
 
-For advanced usage with dynamic credentials:
+For advanced usage with dynamic credentials in supervision trees:
 
 ```elixir
-# Use config resolver for automatic credential refresh
-{:ok, conn} = Postgrex.start_link([
-  hostname: "10.0.0.1",
-  database: "postgres",
-  config_resolver: &Goth.AlloyDB.config_resolver/1
-])
+# config/config.exs - define reusable cluster configurations
+config :goth_alloydb, :clusters,
+  prod: [
+    project_id: "my-project",
+    location: "us-central1",
+    cluster: "my-alloydb-cluster"
+  ]
+
+# Supervision tree with config resolver
+children = [
+  {Goth, name: MyApp.Goth, source: {:metadata, []}},
+  
+  {Postgrex,
+   hostname: "10.0.0.1",
+   database: "postgres",
+   cluster_config: :prod,
+   goth_server: MyApp.Goth,
+   config_resolver: &Goth.AlloyDB.config_resolver/1}
+]
 ```
 
 See `Goth.AlloyDB` module documentation for complete API reference.
