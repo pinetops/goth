@@ -117,16 +117,17 @@ defmodule Goth.AlloyDB do
   """
   @spec get_project_id(atom()) :: {:ok, String.t()} | {:error, term()}
   def get_project_id(goth_name) do
-    try do
-      # Try to get the project_id from the Goth server's credentials
-      state = :sys.get_state(goth_name)
-      
-      case extract_project_id_from_state(state) do
-        {:ok, project_id} -> {:ok, project_id}
-        :not_found -> get_project_id_from_metadata()
-      end
-    rescue
-      _ -> get_project_id_from_metadata()
+    # Try metadata service first (most reliable on GCP)
+    case get_project_id_from_metadata() do
+      {:ok, project_id} -> {:ok, project_id}
+      {:error, _} ->
+        # Fall back to trying Goth server state
+        try do
+          state = :sys.get_state(goth_name)
+          extract_project_id_from_state(state)
+        rescue
+          _ -> {:error, "Could not determine project_id from metadata service or Goth server"}
+        end
     end
   end
 
