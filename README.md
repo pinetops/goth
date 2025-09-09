@@ -99,13 +99,19 @@ See `Goth.start_link/1` for more information about possible configuration option
 
 ## AlloyDB Integration
 
-Goth includes built-in support for Google Cloud AlloyDB IAM authentication with automatic certificate management:
+Goth includes built-in support for Google Cloud AlloyDB IAM authentication with automatic certificate management.
+
+### Standalone Postgrex Connections
+
+For direct database connections (scripts, GenServers, etc.):
 
 ```elixir
-# Start Goth server
-{:ok, _} = Goth.AlloyDB.start_link(name: MyApp.Goth)
+# Supervision tree
+children = [
+  {Goth, name: MyApp.Goth, source: {:metadata, []}}
+]
 
-# Generate complete Postgrex configuration
+# Create connection
 config = Goth.AlloyDB.postgrex_config(
   goth_name: MyApp.Goth,
   hostname: "10.0.0.1",  # AlloyDB private IP
@@ -119,36 +125,38 @@ config = Goth.AlloyDB.postgrex_config(
 {:ok, conn} = Postgrex.start_link(config)
 ```
 
-Features:
-- **Native RSA Key Generation** - Zero OpenSSL dependencies using Elixir/Erlang crypto
-- **Automatic Certificate Management** - Dynamic client certificates via AlloyDB Admin API  
-- **Token Refresh** - Automatic OAuth2 token renewal
-- **Postgrex Integration** - Drop-in configuration helpers
-- **Config Resolver Support** - Dynamic credential injection for connection pools
+### Ecto Integration
 
-For advanced usage with dynamic credentials in supervision trees:
+For production applications using Ecto:
 
 ```elixir
-# config/config.exs - define reusable cluster configurations
-config :goth_alloydb, :clusters,
+# config/config.exs
+config :goth, :alloydb_clusters,
   prod: [
     project_id: "my-project",
     location: "us-central1",
     cluster: "my-alloydb-cluster"
   ]
 
-# Supervision tree with config resolver
+config :my_app, MyApp.Repo,
+  hostname: "10.0.0.1",
+  database: "postgres",
+  cluster_config: :prod,
+  goth_server: MyApp.Goth,
+  config_resolver: &Goth.AlloyDB.config_resolver/1
+
+# Supervision tree
 children = [
   {Goth, name: MyApp.Goth, source: {:metadata, []}},
-  
-  {Postgrex,
-   hostname: "10.0.0.1",
-   database: "postgres",
-   cluster_config: :prod,
-   goth_server: MyApp.Goth,
-   config_resolver: &Goth.AlloyDB.config_resolver/1}
+  MyApp.Repo
 ]
 ```
+
+### Features
+- **Zero Dependencies** - Pure Elixir/Erlang crypto, no OpenSSL
+- **Automatic Certificate Management** - Dynamic client certificates via AlloyDB Admin API  
+- **Token Refresh** - Automatic OAuth2 token renewal
+- **Ecto Integration** - Works seamlessly with Ecto repos
 
 See `Goth.AlloyDB` module documentation for complete API reference.
 

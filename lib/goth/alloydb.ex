@@ -11,10 +11,9 @@ defmodule Goth.AlloyDB do
 
   ## Usage
 
-      # Basic token fetching
-      {:ok, token} = Goth.AlloyDB.get_token(MyApp.Goth)
+  ### Standalone Postgrex Connections
 
-      # IAM authentication (verbose form)
+      # Generate complete Postgrex configuration
       config = Goth.AlloyDB.postgrex_config(
         goth_name: MyApp.Goth,
         hostname: "10.0.0.1",
@@ -26,35 +25,27 @@ defmodule Goth.AlloyDB do
       )
       {:ok, conn} = Postgrex.start_link(config)
 
-      # With cluster configuration (recommended)
+  ### Ecto Integration
+
       # config/config.exs
-      config :goth_alloydb, :clusters,
+      config :goth, :alloydb_clusters,
         prod: [
-          project_id: "prod-project",
+          project_id: "my-project",
           location: "us-central1", 
-          cluster: "prod-cluster"
+          cluster: "my-cluster"
         ]
 
-      # Clean usage with cluster config
-      config = Goth.AlloyDB.postgrex_config(
-        goth_name: MyApp.Goth,
-        cluster_config: :prod,
+      config :my_app, MyApp.Repo,
         hostname: "10.0.0.1",
         database: "postgres",
-        username: "user@example.com"
-      )
-      {:ok, conn} = Postgrex.start_link(config)
+        cluster_config: :prod,
+        goth_server: MyApp.Goth,
+        config_resolver: &Goth.AlloyDB.config_resolver/1
 
-      # Config resolver pattern (cleanest for supervision trees)
+      # Supervision tree
       children = [
         {Goth, name: MyApp.Goth, source: {:metadata, []}},
-        
-        {Postgrex,
-         hostname: "10.0.0.1",
-         database: "postgres",
-         cluster_config: :prod,
-         goth_server: MyApp.Goth,                        # ← Consistent with other Goth usage
-         config_resolver: &Goth.AlloyDB.config_resolver/1}
+        MyApp.Repo
       ]
 
   ## AlloyDB Authentication Modes
@@ -674,7 +665,7 @@ defmodule Goth.AlloyDB do
         opts
       cluster_name ->
         # Look up cluster configuration
-        clusters = Application.get_env(:goth_alloydb, :clusters, %{})
+        clusters = Application.get_env(:goth, :alloydb_clusters, %{})
         case Map.get(clusters, cluster_name) do
           nil ->
             raise ArgumentError, "Unknown cluster_config: #{inspect(cluster_name)}. Available: #{inspect(Map.keys(clusters))}"
