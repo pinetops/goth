@@ -107,12 +107,9 @@ defmodule Goth.AlloyDB do
   alias Goth.Token
 
 
-  @default_scopes ["https://www.googleapis.com/auth/cloud-platform"]
   @cert_cache_table :goth_alloydb_cert_cache
   @cert_lifetime_hours 24
   @refresh_before_minutes 60
-  @refresh_buffer_minutes 4
-  @refresh_timeout_seconds 60
 
   @doc """
   Fetches an OAuth2 access token from a Goth server.
