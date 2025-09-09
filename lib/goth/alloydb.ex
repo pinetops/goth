@@ -84,6 +84,8 @@ defmodule Goth.AlloyDB do
   @cert_cache_table :goth_alloydb_cert_cache
   @cert_lifetime_hours 24
   @refresh_before_minutes 60
+  @refresh_buffer_minutes 4  # Go uses 4 minutes like the official connector
+  @refresh_timeout_seconds 60
 
   @doc """
   Fetches an OAuth2 access token from a Goth server.
@@ -494,6 +496,48 @@ defmodule Goth.AlloyDB do
       #   }
       # ]
   """
+  @doc """
+  Forces an immediate refresh of certificates for the given options.
+  This clears the cache and forces regeneration on next use.
+  
+  ## Examples
+  
+      # Clear all cached certificates
+      Goth.AlloyDB.force_refresh()
+      
+      # Clear certificate for specific instance
+      Goth.AlloyDB.force_refresh(
+        project_id: "my-project",
+        location: "us-central1", 
+        cluster: "my-cluster",
+        hostname: "10.0.0.1"
+      )
+  """
+  @spec force_refresh(keyword()) :: :ok
+  def force_refresh(opts \\ []) do
+    ensure_cert_cache_table()
+    
+    case opts do
+      [] ->
+        # Clear all cached certificates
+        :ets.delete_all_objects(@cert_cache_table)
+        Logger.info("Force refresh: All cached certificates cleared")
+        :ok
+        
+      _ ->
+        # Clear specific certificate
+        cache_key = build_cert_cache_key(opts)
+        case :ets.delete(@cert_cache_table, cache_key) do
+          true ->
+            Logger.info("Force refresh: Certificate cleared for #{inspect(cache_key)}")
+            :ok
+          false ->
+            Logger.info("Force refresh: No certificate found for #{inspect(cache_key)}")
+            :ok
+        end
+    end
+  end
+
   @spec cert_cache_info() :: [map()]
   def cert_cache_info do
     case :ets.whereis(@cert_cache_table) do
@@ -519,13 +563,19 @@ defmodule Goth.AlloyDB do
   # Private functions
 
   defp build_cert_cache_key(opts) do
-    # Build cache key from AlloyDB cluster identity
+    # Build cache key from AlloyDB cluster identity and connection type
     project_id = Keyword.fetch!(opts, :project_id)
     location = Keyword.fetch!(opts, :location)
     cluster = Keyword.fetch!(opts, :cluster)
     hostname = Keyword.fetch!(opts, :hostname)
+    ip_type = Keyword.get(opts, :ip_type, :private)
     
-    {project_id, location, cluster, hostname}
+    # Validate IP type
+    unless ip_type in [:private, :public, :psc] do
+      raise ArgumentError, "Invalid ip_type: #{inspect(ip_type)}. Must be one of: :private, :public, :psc"
+    end
+    
+    {project_id, location, cluster, hostname, ip_type}
   end
 
   defp get_cached_certificate(cache_key) do
