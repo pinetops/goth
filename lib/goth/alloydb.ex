@@ -104,7 +104,7 @@ defmodule Goth.AlloyDB do
   @cert_cache_table :goth_alloydb_cert_cache
   @cert_lifetime_hours 24
   @refresh_before_minutes 60
-  @refresh_buffer_minutes 4  # Go uses 4 minutes like the official connector
+  @refresh_buffer_minutes 4
   @refresh_timeout_seconds 60
 
   @doc """
@@ -174,7 +174,7 @@ defmodule Goth.AlloyDB do
   """
   @spec generate_rsa_keypair(pos_integer()) :: {binary(), binary()}
   def generate_rsa_keypair(bits \\ 2048) do
-    # Generate using crypto module - works in OTP 27
+    # Generate using crypto module
     {public_key, private_key_list} = :crypto.generate_key(:rsa, {bits, 65537})
     
     # Extract components
@@ -191,9 +191,9 @@ defmodule Goth.AlloyDB do
     dq_int = :crypto.bytes_to_integer(dq)
     qinv_int = :crypto.bytes_to_integer(qinv)
     
-    # Create properly structured RSA records for OTP 27
+    # Create properly structured RSA records
     rsa_private_key = {:RSAPrivateKey,
-                       0,        # version as integer (not atom)
+                       0,        # version
                        n_int,    # modulus
                        e_int,    # publicExponent  
                        d_int,    # privateExponent
@@ -202,7 +202,7 @@ defmodule Goth.AlloyDB do
                        dp_int,   # exponent1
                        dq_int,   # exponent2
                        qinv_int, # coefficient
-                       :asn1_NOVALUE} # otherPrimeInfos (required)
+                       :asn1_NOVALUE} # otherPrimeInfos
     
     rsa_public_key = {:RSAPublicKey, n_int, e_int}
     
@@ -298,9 +298,8 @@ defmodule Goth.AlloyDB do
   @doc """
   Generates complete SSL configuration for AlloyDB connection with caching.
 
-  Creates temporary certificate files and returns SSL options suitable 
-  for Postgrex. Certificates are cached for performance and automatically
-  refreshed before expiry.
+  Returns SSL options suitable for Postgrex with in-memory certificates. 
+  Certificates are cached for performance and automatically refreshed before expiry.
 
   ## Examples
 
@@ -338,7 +337,7 @@ defmodule Goth.AlloyDB do
          true <- validate_rsa_keypair(private_pem, public_pem),
          {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
       
-      # Parse certificates for in-memory use (no temp files!)
+      # Parse certificates for in-memory use
       {client_cert_der, key_tuple, ca_cert_der} = parse_ssl_cert_and_key(hd(cert_chain), private_pem, ca_cert)
       
       ssl_config = [
@@ -414,17 +413,17 @@ defmodule Goth.AlloyDB do
       raise ArgumentError, "Invalid auth_mode: #{inspect(auth_mode)}. Must be one of: :iam, :native"
     end
     
-    # Get OAuth token (required for both auth modes for certificate generation)
+    # Get OAuth token for certificate generation
     token = get_token!(goth_name)
     {:ok, ssl_config} = generate_ssl_config(token, opts)
     
     # Determine password based on auth mode
     password = case auth_mode do
       :iam ->
-        # IAM mode: use OAuth token as password
+        # IAM mode: OAuth token as password
         token
       :native ->
-        # DB_NATIVE mode: use provided password
+        # Native mode: provided password
         case Keyword.get(opts, :password) do
           nil ->
             raise ArgumentError, "Password is required for :native auth_mode"
@@ -487,7 +486,7 @@ defmodule Goth.AlloyDB do
       raise ArgumentError, "Invalid auth_mode: #{inspect(auth_mode)}. Must be one of: :iam, :native"
     end
     
-    # Generate fresh OAuth token (required for both auth modes for certificate generation)
+    # Generate fresh OAuth token for certificate generation
     token = get_token!(goth_name)
     
     ssl_opts = [
@@ -502,11 +501,11 @@ defmodule Goth.AlloyDB do
         # Configure auth based on mode
         {username, password} = case auth_mode do
           :iam ->
-            # IAM mode: get username from config/env, use OAuth token as password
+            # IAM mode: OAuth token as password
             username = get_required_opt(opts, :username, "ALLOYDB_IAM_USER")
             {username, token}
           :native ->
-            # DB_NATIVE mode: get both username and password from config/env
+            # Native mode: provided credentials
             username = get_required_opt(opts, :username, "ALLOYDB_DB_USER")
             password = get_required_opt(opts, :password, "ALLOYDB_DB_PASSWORD")
             {username, password}
@@ -540,8 +539,7 @@ defmodule Goth.AlloyDB do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    # Just pass through to Goth.start_link without adding scope
-    # The caller should provide appropriate source configuration
+    # Pass through to Goth.start_link
     Goth.start_link(opts)
   end
 
@@ -566,23 +564,6 @@ defmodule Goth.AlloyDB do
   end
 
   @doc """
-  Returns information about cached certificates.
-
-  ## Examples
-
-      Goth.AlloyDB.cert_cache_info()
-      # => [
-      #   %{
-      #     project_id: "my-project",
-      #     location: "us-central1", 
-      #     cluster: "my-cluster",
-      #     hostname: "10.0.0.1",
-      #     expires_at: 1234567890,
-      #     expires_in_seconds: 3600
-      #   }
-      # ]
-  """
-  @doc """
   Forces an immediate refresh of certificates for the given options.
   This clears the cache and forces regeneration on next use.
   
@@ -605,7 +586,7 @@ defmodule Goth.AlloyDB do
     
     case opts do
       [] ->
-        # Clear all cached certificates
+        # Clear all certificates
         :ets.delete_all_objects(@cert_cache_table)
         Logger.info("Force refresh: All cached certificates cleared")
         :ok
@@ -624,6 +605,23 @@ defmodule Goth.AlloyDB do
     end
   end
 
+  @doc """
+  Returns information about cached certificates.
+
+  ## Examples
+
+      Goth.AlloyDB.cert_cache_info()
+      # => [
+      #   %{
+      #     project_id: "my-project",
+      #     location: "us-central1", 
+      #     cluster: "my-cluster",
+      #     hostname: "10.0.0.1",
+      #     expires_at: 1234567890,
+      #     expires_in_seconds: 3600
+      #   }
+      # ]
+  """
   @spec cert_cache_info() :: [map()]
   def cert_cache_info do
     case :ets.whereis(@cert_cache_table) do
@@ -649,7 +647,7 @@ defmodule Goth.AlloyDB do
   # Private functions
 
   defp build_cert_cache_key(opts) do
-    # Build cache key from AlloyDB cluster identity and connection type
+    # Build cache key from AlloyDB instance identity
     project_id = Keyword.fetch!(opts, :project_id)
     location = Keyword.fetch!(opts, :location)
     cluster = Keyword.fetch!(opts, :cluster)
@@ -673,10 +671,8 @@ defmodule Goth.AlloyDB do
         refresh_threshold = expires_at - (@refresh_before_minutes * 60)
         
         if now < refresh_threshold do
-          # Certificate is still fresh
           {:ok, ssl_config}
         else
-          # Certificate needs refresh
           :cache_miss
         end
         
@@ -692,7 +688,7 @@ defmodule Goth.AlloyDB do
          true <- validate_rsa_keypair(private_pem, public_pem),
          {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
       
-      # Parse certificates for in-memory use (no temp files!)
+      # Parse certificates for in-memory use
       {client_cert_der, key_tuple, ca_cert_der} = parse_ssl_cert_and_key(hd(cert_chain), private_pem, ca_cert)
       
       ssl_config = [
@@ -734,14 +730,14 @@ defmodule Goth.AlloyDB do
   end
 
   defp parse_ssl_cert_and_key(client_cert_pem, private_key_pem, ca_cert_pem) do
-    # Extract DER data for certificates (direct binary)
+    # Extract DER data for certificates
     client_cert_der = extract_cert_der(client_cert_pem)
     ca_cert_der = extract_cert_der(ca_cert_pem)
     
-    # Extract key with proper tuple format: {KeyType, DerData}
+    # Extract key in tuple format: {KeyType, DerData}
     [key_entry] = :public_key.pem_decode(private_key_pem)
-    key_der = elem(key_entry, 1)  # Get DER data
-    key_type = elem(key_entry, 0)  # Get type (RSAPrivateKey, etc.)
+    key_der = elem(key_entry, 1)
+    key_type = elem(key_entry, 0)
     key_tuple = {key_type, key_der}
     
     {client_cert_der, key_tuple, ca_cert_der}
@@ -752,7 +748,7 @@ defmodule Goth.AlloyDB do
     pem_data
     |> :public_key.pem_decode()
     |> Enum.find(fn {type, _der, _} -> type == :Certificate end)
-    |> elem(1)  # Get DER data
+    |> elem(1)
   end
 
   defp verify_fun(_, {:bad_cert, :unknown_ca}, _), do: {:valid, nil}
