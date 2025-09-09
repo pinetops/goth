@@ -130,20 +130,15 @@ config = Goth.AlloyDB.postgrex_config(
 For production applications using Ecto:
 
 ```elixir
-# config/config.exs
-config :goth, :alloydb_clusters,
-  prod: [
-    project_id: "my-project",
-    location: "us-central1",
-    cluster: "my-alloydb-cluster"
-  ]
-
 config :my_app, MyApp.Repo,
   hostname: "10.0.0.1",
   database: "postgres",
-  cluster_config: :prod,
+  username: "user@example.com",
+  location: "us-central1",
+  cluster: "my-alloydb-cluster",
   goth_server: MyApp.Goth,
   config_resolver: &Goth.AlloyDB.config_resolver/1
+  # project_id auto-derived from Goth server
 
 # Supervision tree
 children = [

@@ -13,34 +13,30 @@ defmodule Goth.AlloyDB do
 
   ### Standalone Postgrex Connections
 
-      # Generate complete Postgrex configuration
+      # Most common: AlloyDB in same GCP project as your application
       config = Goth.AlloyDB.postgrex_config(
         goth_name: MyApp.Goth,
-        hostname: "10.0.0.1",
+        hostname: "10.0.0.1",             # AlloyDB private IP
         database: "postgres",
-        username: "user@example.com",
-        project_id: "my-project",
-        location: "us-central1",
-        cluster: "my-cluster"
+        username: "myapp@myproject.iam",  # IAM user: service-account@project.iam
+        location: "us-central1",          # AlloyDB region
+        cluster: "production-cluster"     # AlloyDB cluster name
+        # project_id auto-derived from Goth server credentials
       )
       {:ok, conn} = Postgrex.start_link(config)
 
   ### Ecto Integration
 
-      # config/config.exs
-      config :goth, :alloydb_clusters,
-        prod: [
-          project_id: "my-project",
-          location: "us-central1", 
-          cluster: "my-cluster"
-        ]
-
+      # config/config.exs - Common production setup
       config :my_app, MyApp.Repo,
-        hostname: "10.0.0.1",
+        hostname: "10.0.0.1",             # AlloyDB private IP  
         database: "postgres",
-        cluster_config: :prod,
+        username: "myapp@myproject.iam",  # IAM service account
+        location: "us-central1",          # AlloyDB region
+        cluster: "production-cluster",    # AlloyDB cluster name
         goth_server: MyApp.Goth,
         config_resolver: &Goth.AlloyDB.config_resolver/1
+        # project_id auto-derived from Goth server credentials
 
       # Supervision tree
       children = [
@@ -110,6 +106,40 @@ defmodule Goth.AlloyDB do
   @cert_cache_table :goth_alloydb_cert_cache
   @cert_lifetime_hours 24
   @refresh_before_minutes 60
+
+  @doc """
+  Gets the project_id from Goth server credentials.
+  
+  ## Examples
+  
+      {:ok, project_id} = Goth.AlloyDB.get_project_id(MyApp.Goth)
+      # => "my-project-123"
+  """
+  @spec get_project_id(atom()) :: {:ok, String.t()} | {:error, term()}
+  def get_project_id(goth_name) do
+    try do
+      # Try to get the project_id from the Goth server's credentials
+      state = :sys.get_state(goth_name)
+      
+      case extract_project_id_from_state(state) do
+        {:ok, project_id} -> {:ok, project_id}
+        :not_found -> get_project_id_from_metadata()
+      end
+    rescue
+      _ -> get_project_id_from_metadata()
+    end
+  end
+
+  @doc """
+  Gets project_id and raises on error.
+  """
+  @spec get_project_id!(atom()) :: String.t()
+  def get_project_id!(goth_name) do
+    case get_project_id(goth_name) do
+      {:ok, project_id} -> project_id
+      {:error, reason} -> raise "Failed to get project_id: #{inspect(reason)}"
+    end
+  end
 
   @doc """
   Fetches an OAuth2 access token from a Goth server.
@@ -317,9 +347,7 @@ defmodule Goth.AlloyDB do
   """
   @spec generate_ssl_config(String.t(), keyword()) :: {:ok, keyword()} | {:error, term()}
   def generate_ssl_config(token, opts) do
-    # Resolve cluster configuration
-    resolved_opts = resolve_cluster_config(opts)
-    cache_key = build_cert_cache_key(resolved_opts)
+    cache_key = build_cert_cache_key(opts)
     
     case get_cached_certificate(cache_key) do
       {:ok, ssl_config} ->
@@ -328,7 +356,7 @@ defmodule Goth.AlloyDB do
         
       :cache_miss ->
         Logger.debug("Generating new AlloyDB certificate")
-        generate_and_cache_ssl_config(token, resolved_opts, cache_key)
+        generate_and_cache_ssl_config(token, opts, cache_key)
     end
   end
 
@@ -337,13 +365,11 @@ defmodule Goth.AlloyDB do
   """
   @spec generate_ssl_config_uncached(String.t(), keyword()) :: {:ok, keyword()} | {:error, term()}
   def generate_ssl_config_uncached(token, opts) do
-    # Resolve cluster configuration
-    resolved_opts = resolve_cluster_config(opts)
-    hostname = Keyword.fetch!(resolved_opts, :hostname)
+    hostname = Keyword.fetch!(opts, :hostname)
     
     with {private_pem, public_pem} <- generate_rsa_keypair(),
          true <- validate_rsa_keypair(private_pem, public_pem),
-         {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, resolved_opts) do
+         {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
       
       # Parse certificates for in-memory use
       {client_cert_der, key_tuple, ca_cert_der} = parse_ssl_cert_and_key(hd(cert_chain), private_pem, ca_cert)
@@ -408,16 +434,13 @@ defmodule Goth.AlloyDB do
   """
   @spec postgrex_config(keyword()) :: keyword()
   def postgrex_config(opts) do
-    # Resolve cluster configuration first
-    resolved_opts = resolve_cluster_config(opts)
-    
-    goth_name = Keyword.fetch!(resolved_opts, :goth_name)
-    hostname = Keyword.fetch!(resolved_opts, :hostname)
-    database = Keyword.fetch!(resolved_opts, :database)
-    username = Keyword.fetch!(resolved_opts, :username)
-    port = Keyword.get(resolved_opts, :port, 5432)
-    timeout = Keyword.get(resolved_opts, :timeout, 15000)
-    auth_mode = Keyword.get(resolved_opts, :auth_mode, :iam)
+    goth_name = Keyword.fetch!(opts, :goth_name)
+    hostname = Keyword.fetch!(opts, :hostname)
+    database = Keyword.fetch!(opts, :database)
+    username = Keyword.fetch!(opts, :username)
+    port = Keyword.get(opts, :port, 5432)
+    timeout = Keyword.get(opts, :timeout, 15000)
+    auth_mode = Keyword.get(opts, :auth_mode, :iam)
     
     # Validate auth_mode
     unless auth_mode in [:iam, :native] do
@@ -426,7 +449,12 @@ defmodule Goth.AlloyDB do
     
     # Get OAuth token for certificate generation
     token = get_token!(goth_name)
-    {:ok, ssl_config} = generate_ssl_config(token, resolved_opts)
+    
+    # Auto-derive project_id if not provided
+    ssl_opts = opts
+    |> Keyword.put_new_lazy(:project_id, fn -> get_project_id!(goth_name) end)
+    
+    {:ok, ssl_config} = generate_ssl_config(token, ssl_opts)
     
     # Determine password based on auth mode
     password = case auth_mode do
@@ -435,7 +463,7 @@ defmodule Goth.AlloyDB do
         token
       :native ->
         # Native mode: provided password
-        case Keyword.get(resolved_opts, :password) do
+        case Keyword.get(opts, :password) do
           nil ->
             raise ArgumentError, "Password is required for :native auth_mode"
           password ->
@@ -479,16 +507,13 @@ defmodule Goth.AlloyDB do
   """
   @spec config_resolver(keyword()) :: keyword()
   def config_resolver(opts) do
-    # Resolve cluster configuration first
-    resolved_opts = resolve_cluster_config(opts)
-    
     # Extract Goth server from connection options (consistent with other Goth usage)
-    goth_server = Keyword.fetch!(resolved_opts, :goth_server)
+    goth_server = Keyword.fetch!(opts, :goth_server)
     
-    project_id = get_required_opt(resolved_opts, :project_id, "ALLOYDB_PROJECT_ID")
-    location = get_required_opt(resolved_opts, :location, "ALLOYDB_LOCATION")
-    cluster = get_required_opt(resolved_opts, :cluster, "ALLOYDB_CLUSTER")
-    auth_mode = Keyword.get(resolved_opts, :auth_mode, :iam)
+    project_id = get_required_opt_with_goth_fallback(opts, :project_id, "ALLOYDB_PROJECT_ID", goth_server)
+    location = get_required_opt(opts, :location, "ALLOYDB_LOCATION")
+    cluster = get_required_opt(opts, :cluster, "ALLOYDB_CLUSTER")
+    auth_mode = Keyword.get(opts, :auth_mode, :iam)
     
     # Validate auth_mode
     unless auth_mode in [:iam, :native] do
@@ -502,7 +527,7 @@ defmodule Goth.AlloyDB do
       project_id: project_id,
       location: location,
       cluster: cluster,
-      hostname: resolved_opts[:hostname]
+      hostname: opts[:hostname]
     ]
     
     case generate_ssl_config(token, ssl_opts) do
@@ -511,12 +536,12 @@ defmodule Goth.AlloyDB do
         {username, password} = case auth_mode do
           :iam ->
             # IAM mode: OAuth token as password
-            username = get_required_opt(resolved_opts, :username, "ALLOYDB_IAM_USER")
+            username = get_required_opt(opts, :username, "ALLOYDB_IAM_USER")
             {username, token}
           :native ->
             # Native mode: provided credentials
-            username = get_required_opt(resolved_opts, :username, "ALLOYDB_DB_USER")
-            password = get_required_opt(resolved_opts, :password, "ALLOYDB_DB_PASSWORD")
+            username = get_required_opt(opts, :username, "ALLOYDB_DB_USER")
+            password = get_required_opt(opts, :password, "ALLOYDB_DB_PASSWORD")
             {username, password}
         end
         
@@ -655,24 +680,6 @@ defmodule Goth.AlloyDB do
 
   # Private functions
 
-  defp resolve_cluster_config(opts) do
-    case Keyword.get(opts, :cluster_config) do
-      nil ->
-        # No cluster_config specified, expect individual parameters
-        opts
-      cluster_name ->
-        # Look up cluster configuration
-        clusters = Application.get_env(:goth, :alloydb_clusters, %{})
-        case Map.get(clusters, cluster_name) do
-          nil ->
-            raise ArgumentError, "Unknown cluster_config: #{inspect(cluster_name)}. Available: #{inspect(Map.keys(clusters))}"
-          cluster_opts ->
-            # Merge cluster config with opts, opts take precedence
-            Keyword.merge(cluster_opts, Keyword.delete(opts, :cluster_config))
-        end
-    end
-  end
-
   defp build_cert_cache_key(opts) do
     # Build cache key from AlloyDB instance identity
     project_id = Keyword.fetch!(opts, :project_id)
@@ -793,6 +800,59 @@ defmodule Goth.AlloyDB do
         end
       value -> 
         value
+    end
+  end
+
+  defp get_required_opt_with_goth_fallback(opts, key, env_var, goth_server) do
+    case Keyword.get(opts, key) do
+      nil ->
+        case System.get_env(env_var) do
+          nil ->
+            # Try to get from Goth server (only works for project_id)
+            if key == :project_id do
+              case get_project_id(goth_server) do
+                {:ok, project_id} -> project_id
+                {:error, _} -> raise "Missing required option :#{key}, env var #{env_var}, and could not derive from Goth server"
+              end
+            else
+              raise "Missing required option :#{key} or env var #{env_var}"
+            end
+          value -> value
+        end
+      value -> 
+        value
+    end
+  end
+
+  # Helper functions for project_id extraction
+
+  defp extract_project_id_from_state(state) do
+    # Try to extract project_id from Goth server state
+    # This depends on Goth's internal structure which may change
+    try do
+      case state do
+        %{source: {:service_account, credentials}} when is_map(credentials) ->
+          case Map.get(credentials, "project_id") do
+            nil -> :not_found
+            project_id -> {:ok, project_id}
+          end
+        _ ->
+          :not_found
+      end
+    rescue
+      _ -> :not_found
+    end
+  end
+
+  defp get_project_id_from_metadata do
+    # Try to get project_id from GCP metadata service
+    case HTTPoison.get("http://metadata.google.internal/computeMetadata/v1/project/project-id", 
+                       [{"Metadata-Flavor", "Google"}], 
+                       [timeout: 5000]) do
+      {:ok, %{status_code: 200, body: project_id}} ->
+        {:ok, String.trim(project_id)}
+      _ ->
+        {:error, "Could not determine project_id from Goth or metadata service"}
     end
   end
 end
