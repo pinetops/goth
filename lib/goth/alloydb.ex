@@ -316,15 +316,15 @@ defmodule Goth.AlloyDB do
          true <- validate_rsa_keypair(private_pem, public_pem),
          {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
       
-      # Write certificates to temporary files
-      cert_file = write_temp_file("alloydb_client_cert", hd(cert_chain))
-      key_file = write_temp_file("alloydb_client_key", private_pem) 
-      ca_file = write_temp_file("alloydb_ca_cert", ca_cert)
+      # Parse certificates for in-memory use (no temp files)
+      client_cert = parse_pem_cert(hd(cert_chain))
+      private_key = parse_pem_key(private_pem)
+      ca_certs = [parse_pem_cert(ca_cert)]
       
       ssl_config = [
-        certfile: cert_file,
-        keyfile: key_file,
-        cacertfile: ca_file,
+        cert: client_cert,
+        key: private_key,
+        cacerts: ca_certs,
         verify: :verify_peer,
         versions: [:"tlsv1.3"],
         server_name: String.to_charlist(hostname),
