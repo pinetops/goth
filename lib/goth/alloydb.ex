@@ -451,8 +451,10 @@ defmodule Goth.AlloyDB do
     token = get_token!(goth_name)
     
     # Auto-derive project_id if not provided
-    ssl_opts = opts
-    |> Keyword.put_new_lazy(:project_id, fn -> get_project_id!(goth_name) end)
+    ssl_opts = case Keyword.get(opts, :project_id) do
+      nil -> Keyword.put(opts, :project_id, get_project_id!(goth_name))
+      _ -> opts
+    end
     
     {:ok, ssl_config} = generate_ssl_config(token, ssl_opts)
     
