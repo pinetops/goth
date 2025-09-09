@@ -111,15 +111,13 @@ children = [
   {Goth, name: MyApp.Goth, source: {:metadata, []}}
 ]
 
-# Create connection
+# Create connection using AlloyDB instance URI
 config = Goth.AlloyDB.postgrex_config(
   goth_name: MyApp.Goth,
-  hostname: "10.0.0.1",  # AlloyDB private IP
+  instance_uri: "projects/my-project/locations/us-central1/clusters/prod/instances/primary",
   database: "postgres",
-  username: "user@example.com",  # IAM user
-  project_id: "my-project",
-  location: "us-central1",
-  cluster: "my-alloydb-cluster"
+  username: "user@example.com"  # IAM service account
+  # All AlloyDB details auto-derived from instance_uri!
 )
 
 {:ok, conn} = Postgrex.start_link(config)
@@ -131,14 +129,11 @@ For production applications using Ecto:
 
 ```elixir
 config :my_app, MyApp.Repo,
-  hostname: "10.0.0.1",
+  instance_uri: "projects/my-project/locations/us-central1/clusters/prod/instances/primary",
   database: "postgres",
   username: "user@example.com",
-  location: "us-central1",
-  cluster: "my-alloydb-cluster",
   goth_server: MyApp.Goth,
   config_resolver: &Goth.AlloyDB.config_resolver/1
-  # project_id auto-derived from Goth server
 
 # Supervision tree
 children = [

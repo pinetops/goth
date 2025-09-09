@@ -13,30 +13,24 @@ defmodule Goth.AlloyDB do
 
   ### Standalone Postgrex Connections
 
-      # Most common: AlloyDB in same GCP project as your application
+      # AlloyDB instance URI (recommended)
       config = Goth.AlloyDB.postgrex_config(
         goth_name: MyApp.Goth,
-        hostname: "10.0.0.1",             # AlloyDB private IP
+        instance_uri: "projects/my-project/locations/us-central1/clusters/prod/instances/primary",
         database: "postgres",
-        username: "myapp@myproject.iam",  # IAM user: service-account@project.iam
-        location: "us-central1",          # AlloyDB region
-        cluster: "production-cluster"     # AlloyDB cluster name
-        # project_id auto-derived from Goth server credentials
+        username: "myapp@myproject.iam"   # IAM service account
+        # All AlloyDB details auto-derived from instance_uri!
       )
       {:ok, conn} = Postgrex.start_link(config)
 
   ### Ecto Integration
 
-      # config/config.exs - Common production setup
       config :my_app, MyApp.Repo,
-        hostname: "10.0.0.1",             # AlloyDB private IP  
+        instance_uri: "projects/my-project/locations/us-central1/clusters/prod/instances/primary",
         database: "postgres",
-        username: "myapp@myproject.iam",  # IAM service account
-        location: "us-central1",          # AlloyDB region
-        cluster: "production-cluster",    # AlloyDB cluster name
+        username: "myapp@myproject.iam",
         goth_server: MyApp.Goth,
         config_resolver: &Goth.AlloyDB.config_resolver/1
-        # project_id auto-derived from Goth server credentials
 
       # Supervision tree
       children = [
@@ -107,6 +101,38 @@ defmodule Goth.AlloyDB do
   @cert_lifetime_hours 24
   @refresh_before_minutes 60
 
+
+  @doc """
+  Parses AlloyDB instance URI into component parts.
+  
+  ## Examples
+  
+      {:ok, components} = Goth.AlloyDB.parse_instance_uri(
+        "projects/my-project/locations/us-central1/clusters/prod/instances/primary"
+      )
+      # => {:ok, %{
+      #      project_id: "my-project",
+      #      location: "us-central1", 
+      #      cluster: "prod",
+      #      instance: "primary",
+      #      hostname: "127.0.0.1"  # Auth proxy listens locally
+      #    }}
+  """
+  @spec parse_instance_uri(String.t()) :: {:ok, map()} | {:error, String.t()}
+  def parse_instance_uri(instance_uri) do
+    case String.split(instance_uri, "/") do
+      ["projects", project_id, "locations", location, "clusters", cluster, "instances", instance] ->
+        {:ok, %{
+          project_id: project_id,
+          location: location,
+          cluster: cluster,
+          instance: instance,
+          hostname: "127.0.0.1"  # Auth proxy default
+        }}
+      _ ->
+        {:error, "Invalid instance URI format. Expected: projects/PROJECT/locations/LOCATION/clusters/CLUSTER/instances/INSTANCE"}
+    end
+  end
 
   @doc """
   Fetches an OAuth2 access token from a Goth server.
@@ -401,13 +427,16 @@ defmodule Goth.AlloyDB do
   """
   @spec postgrex_config(keyword()) :: keyword()
   def postgrex_config(opts) do
-    goth_name = Keyword.fetch!(opts, :goth_name)
-    hostname = Keyword.fetch!(opts, :hostname)
-    database = Keyword.fetch!(opts, :database)
-    username = Keyword.fetch!(opts, :username)
-    port = Keyword.get(opts, :port, 5432)
-    timeout = Keyword.get(opts, :timeout, 15000)
-    auth_mode = Keyword.get(opts, :auth_mode, :iam)
+    # Resolve instance_uri if provided
+    resolved_opts = resolve_instance_uri(opts)
+    
+    goth_name = Keyword.fetch!(resolved_opts, :goth_name)
+    hostname = Keyword.fetch!(resolved_opts, :hostname)
+    database = Keyword.fetch!(resolved_opts, :database)
+    username = Keyword.fetch!(resolved_opts, :username)
+    port = Keyword.get(resolved_opts, :port, 5432)
+    timeout = Keyword.get(resolved_opts, :timeout, 15000)
+    auth_mode = Keyword.get(resolved_opts, :auth_mode, :iam)
     
     # Validate auth_mode
     unless auth_mode in [:iam, :native] do
@@ -418,9 +447,9 @@ defmodule Goth.AlloyDB do
     token = get_token!(goth_name)
     
     # Auto-derive project_id if not provided
-    ssl_opts = case Keyword.get(opts, :project_id) do
-      nil -> Keyword.put(opts, :project_id, Goth.get_project_id!(goth_name))
-      _ -> opts
+    ssl_opts = case Keyword.get(resolved_opts, :project_id) do
+      nil -> Keyword.put(resolved_opts, :project_id, Goth.get_project_id!(goth_name))
+      _ -> resolved_opts
     end
     
     {:ok, ssl_config} = generate_ssl_config(token, ssl_opts)
@@ -432,7 +461,7 @@ defmodule Goth.AlloyDB do
         token
       :native ->
         # Native mode: provided password
-        case Keyword.get(opts, :password) do
+        case Keyword.get(resolved_opts, :password) do
           nil ->
             raise ArgumentError, "Password is required for :native auth_mode"
           password ->
@@ -476,13 +505,16 @@ defmodule Goth.AlloyDB do
   """
   @spec config_resolver(keyword()) :: keyword()
   def config_resolver(opts) do
-    # Extract Goth server from connection options (consistent with other Goth usage)
-    goth_server = Keyword.fetch!(opts, :goth_server)
+    # Resolve instance_uri if provided
+    resolved_opts = resolve_instance_uri(opts)
     
-    project_id = get_required_opt_with_goth_fallback(opts, :project_id, "ALLOYDB_PROJECT_ID", goth_server)
-    location = get_required_opt(opts, :location, "ALLOYDB_LOCATION")
-    cluster = get_required_opt(opts, :cluster, "ALLOYDB_CLUSTER")
-    auth_mode = Keyword.get(opts, :auth_mode, :iam)
+    # Extract Goth server from connection options (consistent with other Goth usage)
+    goth_server = Keyword.fetch!(resolved_opts, :goth_server)
+    
+    project_id = get_required_opt_with_goth_fallback(resolved_opts, :project_id, "ALLOYDB_PROJECT_ID", goth_server)
+    location = get_required_opt(resolved_opts, :location, "ALLOYDB_LOCATION")
+    cluster = get_required_opt(resolved_opts, :cluster, "ALLOYDB_CLUSTER")
+    auth_mode = Keyword.get(resolved_opts, :auth_mode, :iam)
     
     # Validate auth_mode
     unless auth_mode in [:iam, :native] do
@@ -496,7 +528,7 @@ defmodule Goth.AlloyDB do
       project_id: project_id,
       location: location,
       cluster: cluster,
-      hostname: opts[:hostname]
+      hostname: resolved_opts[:hostname]
     ]
     
     case generate_ssl_config(token, ssl_opts) do
@@ -505,12 +537,12 @@ defmodule Goth.AlloyDB do
         {username, password} = case auth_mode do
           :iam ->
             # IAM mode: OAuth token as password
-            username = get_required_opt(opts, :username, "ALLOYDB_IAM_USER")
+            username = get_required_opt(resolved_opts, :username, "ALLOYDB_IAM_USER")
             {username, token}
           :native ->
             # Native mode: provided credentials
-            username = get_required_opt(opts, :username, "ALLOYDB_DB_USER")
-            password = get_required_opt(opts, :password, "ALLOYDB_DB_PASSWORD")
+            username = get_required_opt(resolved_opts, :username, "ALLOYDB_DB_USER")
+            password = get_required_opt(resolved_opts, :password, "ALLOYDB_DB_PASSWORD")
             {username, password}
         end
         
@@ -648,6 +680,27 @@ defmodule Goth.AlloyDB do
   end
 
   # Private functions
+
+  defp resolve_instance_uri(opts) do
+    case Keyword.get(opts, :instance_uri) do
+      nil ->
+        # No instance_uri, return opts as-is
+        opts
+      instance_uri ->
+        # Parse instance_uri and merge with opts
+        case parse_instance_uri(instance_uri) do
+          {:ok, components} ->
+            opts
+            |> Keyword.delete(:instance_uri)
+            |> Keyword.put_new(:hostname, components.hostname)
+            |> Keyword.put_new(:project_id, components.project_id)
+            |> Keyword.put_new(:location, components.location)
+            |> Keyword.put_new(:cluster, components.cluster)
+          {:error, reason} ->
+            raise ArgumentError, reason
+        end
+    end
+  end
 
   defp build_cert_cache_key(opts) do
     # Build cache key from AlloyDB instance identity
