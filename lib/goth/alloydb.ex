@@ -2,10 +2,11 @@ defmodule Goth.AlloyDB do
   @moduledoc """
   Google Cloud AlloyDB integration for Goth.
 
-  This module provides functionality for AlloyDB IAM authentication including:
-  - OAuth2 token management via Goth
+  This module provides functionality for AlloyDB authentication including:
+  - OAuth2 token management via Goth  
   - RSA keypair generation using native Elixir/Erlang crypto
   - Client certificate generation via AlloyDB Admin API
+  - Support for both IAM and native database authentication
   - Postgrex connection helpers
 
   ## Usage
@@ -13,12 +14,23 @@ defmodule Goth.AlloyDB do
       # Basic token fetching
       {:ok, token} = Goth.AlloyDB.get_token(MyApp.Goth)
 
-      # Generate complete Postgrex configuration
+      # IAM authentication (default)
       config = Goth.AlloyDB.postgrex_config(
         goth_name: MyApp.Goth,
         hostname: "10.0.0.1",
         database: "postgres",
         username: "user@example.com"
+      )
+      {:ok, conn} = Postgrex.start_link(config)
+
+      # Native database authentication  
+      config = Goth.AlloyDB.postgrex_config(
+        goth_name: MyApp.Goth,
+        hostname: "10.0.0.1",
+        database: "postgres",
+        username: "dbuser",
+        password: "dbpassword",
+        auth_mode: :native
       )
       {:ok, conn} = Postgrex.start_link(config)
 
@@ -30,13 +42,21 @@ defmodule Goth.AlloyDB do
         config_resolver: resolver
       ])
 
-  ## AlloyDB Authentication Flow
+  ## AlloyDB Authentication Modes
 
+  ### IAM Authentication (`:iam`, default)
   1. **OAuth Token**: Fetched from Goth server (service account or metadata)
   2. **RSA Keypair**: Generated using native Elixir `:crypto.generate_key/2`
   3. **Client Certificate**: Requested from AlloyDB Admin API using public key
   4. **TLS Connection**: Established using client certificate for mutual auth
-  5. **PostgreSQL Auth**: Token used as password with IAM username
+  5. **PostgreSQL Auth**: OAuth token used as password with IAM username
+
+  ### Native Database Authentication (`:native`)
+  1. **OAuth Token**: Still required for certificate generation (AlloyDB requirement)
+  2. **RSA Keypair**: Generated using native Elixir `:crypto.generate_key/2`
+  3. **Client Certificate**: Requested from AlloyDB Admin API using public key
+  4. **TLS Connection**: Established using client certificate for mutual auth
+  5. **PostgreSQL Auth**: Traditional username/password authentication
 
   ## Configuration
 
@@ -340,23 +360,39 @@ defmodule Goth.AlloyDB do
 
   ## Options
 
-    * `:goth_name` - Name of Goth server (required)
+    * `:goth_name` - Name of Goth server (required for both auth modes)
     * `:hostname` - AlloyDB hostname/IP (required) 
     * `:database` - Database name (required)
-    * `:username` - IAM username (required)
+    * `:username` - Database username (required)
+    * `:password` - Database password (required for `:native` auth only)
     * `:project_id` - GCP project ID (required)
     * `:location` - AlloyDB location (required)
     * `:cluster` - AlloyDB cluster name (required)
+    * `:auth_mode` - Authentication mode: `:iam` or `:native` (default: `:iam`)
     * `:port` - Port (default: 5432)
     * `:timeout` - Connection timeout (default: 15000)
 
   ## Examples
 
+      # IAM authentication (default)
       config = Goth.AlloyDB.postgrex_config(
         goth_name: MyApp.Goth,
         hostname: "10.0.0.1",
         database: "postgres", 
         username: "user@example.com",
+        project_id: "my-project",
+        location: "us-central1",
+        cluster: "my-cluster"
+      )
+
+      # Native database authentication
+      config = Goth.AlloyDB.postgrex_config(
+        goth_name: MyApp.Goth,
+        hostname: "10.0.0.1",
+        database: "postgres", 
+        username: "dbuser",
+        password: "dbpassword",
+        auth_mode: :native,
         project_id: "my-project",
         location: "us-central1",
         cluster: "my-cluster"
@@ -371,19 +407,43 @@ defmodule Goth.AlloyDB do
     username = Keyword.fetch!(opts, :username)
     port = Keyword.get(opts, :port, 5432)
     timeout = Keyword.get(opts, :timeout, 15000)
+    auth_mode = Keyword.get(opts, :auth_mode, :iam)
     
+    # Validate auth_mode
+    unless auth_mode in [:iam, :native] do
+      raise ArgumentError, "Invalid auth_mode: #{inspect(auth_mode)}. Must be one of: :iam, :native"
+    end
+    
+    # Get OAuth token (required for both auth modes for certificate generation)
     token = get_token!(goth_name)
     {:ok, ssl_config} = generate_ssl_config(token, opts)
+    
+    # Determine password based on auth mode
+    password = case auth_mode do
+      :iam ->
+        # IAM mode: use OAuth token as password
+        token
+      :native ->
+        # DB_NATIVE mode: use provided password
+        case Keyword.get(opts, :password) do
+          nil ->
+            raise ArgumentError, "Password is required for :native auth_mode"
+          password ->
+            password
+        end
+    end
     
     [
       hostname: hostname,
       port: port,
       database: database,
       username: username,
-      password: token,
+      password: password,
       ssl: ssl_config,
       timeout: timeout,
-      parameters: [application_name: "goth-alloydb"]
+      parameters: [
+        application_name: "goth-alloydb-#{auth_mode}"
+      ]
     ]
   end
 
@@ -395,10 +455,18 @@ defmodule Goth.AlloyDB do
 
   ## Usage
 
-      # In your Postgrex configuration
+      # IAM authentication (default)
       config = [
         hostname: "10.0.0.1",
         database: "postgres",
+        config_resolver: &Goth.AlloyDB.config_resolver/1
+      ]
+
+      # Native database authentication
+      config = [
+        hostname: "10.0.0.1", 
+        database: "postgres",
+        auth_mode: :native,
         config_resolver: &Goth.AlloyDB.config_resolver/1
       ]
 
@@ -412,9 +480,14 @@ defmodule Goth.AlloyDB do
     project_id = get_required_opt(opts, :project_id, "ALLOYDB_PROJECT_ID")
     location = get_required_opt(opts, :location, "ALLOYDB_LOCATION")
     cluster = get_required_opt(opts, :cluster, "ALLOYDB_CLUSTER")
-    username = get_required_opt(opts, :username, "ALLOYDB_IAM_USER")
+    auth_mode = Keyword.get(opts, :auth_mode, :iam)
     
-    # Generate fresh credentials
+    # Validate auth_mode
+    unless auth_mode in [:iam, :native] do
+      raise ArgumentError, "Invalid auth_mode: #{inspect(auth_mode)}. Must be one of: :iam, :native"
+    end
+    
+    # Generate fresh OAuth token (required for both auth modes for certificate generation)
     token = get_token!(goth_name)
     
     ssl_opts = [
@@ -426,11 +499,24 @@ defmodule Goth.AlloyDB do
     
     case generate_ssl_config(token, ssl_opts) do
       {:ok, ssl_config} ->
+        # Configure auth based on mode
+        {username, password} = case auth_mode do
+          :iam ->
+            # IAM mode: get username from config/env, use OAuth token as password
+            username = get_required_opt(opts, :username, "ALLOYDB_IAM_USER")
+            {username, token}
+          :native ->
+            # DB_NATIVE mode: get both username and password from config/env
+            username = get_required_opt(opts, :username, "ALLOYDB_DB_USER")
+            password = get_required_opt(opts, :password, "ALLOYDB_DB_PASSWORD")
+            {username, password}
+        end
+        
         opts
         |> Keyword.put(:username, username)
-        |> Keyword.put(:password, token)
+        |> Keyword.put(:password, password)
         |> Keyword.put(:ssl, ssl_config)
-        |> Keyword.put_new(:parameters, [application_name: "goth-alloydb-resolver"])
+        |> Keyword.put_new(:parameters, [application_name: "goth-alloydb-resolver-#{auth_mode}"])
         
       {:error, reason} ->
         Logger.error("AlloyDB config resolver failed: #{inspect(reason)}")
