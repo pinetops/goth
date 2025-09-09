@@ -623,6 +623,7 @@ defmodule Goth.AlloyDB do
         end
         
         opts
+        |> Keyword.put(:hostname, resolved_opts[:hostname])
         |> Keyword.put(:username, username)
         |> Keyword.put(:password, password)
         |> Keyword.put(:ssl, ssl_config)
