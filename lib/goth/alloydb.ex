@@ -411,7 +411,8 @@ defmodule Goth.AlloyDB do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    opts = Keyword.put_new(opts, :scope, @default_scopes)
+    # Just pass through to Goth.start_link without adding scope
+    # The caller should provide appropriate source configuration
     Goth.start_link(opts)
   end
 
