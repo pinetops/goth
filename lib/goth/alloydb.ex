@@ -316,15 +316,15 @@ defmodule Goth.AlloyDB do
          true <- validate_rsa_keypair(private_pem, public_pem),
          {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
       
-      # Parse certificates for in-memory use (no temp files)
-      client_cert = parse_pem_cert(hd(cert_chain))
-      private_key = parse_pem_key(private_pem)
-      ca_certs = [parse_pem_cert(ca_cert)]
+      # Write certificates to temporary files
+      cert_file = write_temp_file("alloydb_client_cert", hd(cert_chain))
+      key_file = write_temp_file("alloydb_client_key", private_pem) 
+      ca_file = write_temp_file("alloydb_ca_cert", ca_cert)
       
       ssl_config = [
-        cert: client_cert,
-        key: private_key,
-        cacerts: ca_certs,
+        certfile: cert_file,
+        keyfile: key_file,
+        cacertfile: ca_file,
         verify: :verify_peer,
         versions: [:"tlsv1.3"],
         server_name: String.to_charlist(hostname),
@@ -558,15 +558,15 @@ defmodule Goth.AlloyDB do
          true <- validate_rsa_keypair(private_pem, public_pem),
          {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
       
-      # Parse certificates for in-memory use (no temp files)
-      client_cert = parse_pem_cert(hd(cert_chain))
-      private_key = parse_pem_key(private_pem)
-      ca_certs = [parse_pem_cert(ca_cert)]
+      # Write certificates to temporary files
+      cert_file = write_temp_file("alloydb_client_cert", hd(cert_chain))
+      key_file = write_temp_file("alloydb_client_key", private_pem) 
+      ca_file = write_temp_file("alloydb_ca_cert", ca_cert)
       
       ssl_config = [
-        cert: client_cert,
-        key: private_key,
-        cacerts: ca_certs,
+        certfile: cert_file,
+        keyfile: key_file,
+        cacertfile: ca_file,
         verify: :verify_peer,
         versions: [:"tlsv1.3"],
         server_name: String.to_charlist(hostname),
@@ -601,20 +601,11 @@ defmodule Goth.AlloyDB do
     :ets.insert(@cert_cache_table, {cache_key, ssl_config, expires_at})
   end
 
-  defp parse_pem_cert(pem_data) do
-    # For SSL, we need the DER-encoded certificate, not the parsed structure
-    pem_data
-    |> :public_key.pem_decode()
-    |> hd()
-    |> elem(1) # Get the DER data directly
-  end
-
-  defp parse_pem_key(pem_data) do
-    # For SSL, we need the DER-encoded key, not the parsed structure  
-    pem_data
-    |> :public_key.pem_decode()
-    |> hd()
-    |> elem(1) # Get the DER data directly
+  defp write_temp_file(prefix, content) do
+    timestamp = :os.system_time(:microsecond)
+    filename = "/tmp/#{prefix}_#{timestamp}.pem"
+    File.write!(filename, content)
+    filename
   end
 
   defp verify_fun(_, {:bad_cert, :unknown_ca}, _), do: {:valid, nil}
