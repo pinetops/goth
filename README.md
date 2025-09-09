@@ -97,6 +97,48 @@ earlier versions of Goth, [see v1.2.0 documentation on hexdocs.pm](https://hexdo
 See `Goth.start_link/1` for more information about possible configuration options.
 
 
+## AlloyDB Integration
+
+Goth includes built-in support for Google Cloud AlloyDB IAM authentication with automatic certificate management:
+
+```elixir
+# Start Goth server
+{:ok, _} = Goth.AlloyDB.start_link(name: MyApp.Goth)
+
+# Generate complete Postgrex configuration
+config = Goth.AlloyDB.postgrex_config(
+  goth_name: MyApp.Goth,
+  hostname: "10.0.0.1",  # AlloyDB private IP
+  database: "postgres",
+  username: "user@example.com",  # IAM user
+  project_id: "my-project",
+  location: "us-central1",
+  cluster: "my-alloydb-cluster"
+)
+
+{:ok, conn} = Postgrex.start_link(config)
+```
+
+Features:
+- **Native RSA Key Generation** - Zero OpenSSL dependencies using Elixir/Erlang crypto
+- **Automatic Certificate Management** - Dynamic client certificates via AlloyDB Admin API  
+- **Token Refresh** - Automatic OAuth2 token renewal
+- **Postgrex Integration** - Drop-in configuration helpers
+- **Config Resolver Support** - Dynamic credential injection for connection pools
+
+For advanced usage with dynamic credentials:
+
+```elixir
+# Use config resolver for automatic credential refresh
+{:ok, conn} = Postgrex.start_link([
+  hostname: "10.0.0.1",
+  database: "postgres",
+  config_resolver: &Goth.AlloyDB.config_resolver/1
+])
+```
+
+See `Goth.AlloyDB` module documentation for complete API reference.
+
 ## Upgrading from Goth 1.2
 
 See [Upgrading from Goth 1.2](UPGRADE_GUIDE.md) guide for more information.
