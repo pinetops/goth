@@ -602,17 +602,19 @@ defmodule Goth.AlloyDB do
   end
 
   defp parse_pem_cert(pem_data) do
+    # For SSL, we need the DER-encoded certificate, not the parsed structure
     pem_data
     |> :public_key.pem_decode()
     |> hd()
-    |> :public_key.pem_entry_decode()
+    |> elem(1) # Get the DER data directly
   end
 
   defp parse_pem_key(pem_data) do
+    # For SSL, we need the DER-encoded key, not the parsed structure  
     pem_data
     |> :public_key.pem_decode()
     |> hd()
-    |> :public_key.pem_entry_decode()
+    |> elem(1) # Get the DER data directly
   end
 
   defp verify_fun(_, {:bad_cert, :unknown_ca}, _), do: {:valid, nil}
