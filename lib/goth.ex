@@ -283,4 +283,47 @@ defmodule Goth do
   defp registry_name(name) do
     {:via, Registry, {@registry, name}}
   end
+
+  @doc """
+  Gets the project_id for the given Goth server.
+  
+  This is useful for GCP services that need to know the project_id, such as
+  AlloyDB, Cloud SQL, BigQuery, etc.
+  
+  ## Examples
+  
+      {:ok, project_id} = Goth.get_project_id(MyApp.Goth)
+      # => {:ok, "my-project-123"}
+  """
+  @spec get_project_id(atom()) :: {:ok, String.t()} | {:error, term()}
+  def get_project_id(name) do
+    case Goth.Config.get(name, "project_id") do
+      {:ok, project_id} when is_binary(project_id) ->
+        {:ok, project_id}
+      :error ->
+        # Try to get from default account if named account not found
+        case Goth.Config.get(:default, "project_id") do
+          {:ok, project_id} when is_binary(project_id) ->
+            {:ok, project_id}
+          :error ->
+            {:error, "No project_id found in Goth configuration"}
+        end
+    end
+  end
+
+  @doc """
+  Gets the project_id for the given Goth server, raising on error.
+  
+  ## Examples
+  
+      project_id = Goth.get_project_id!(MyApp.Goth)
+      # => "my-project-123"
+  """  
+  @spec get_project_id!(atom()) :: String.t()
+  def get_project_id!(name) do
+    case get_project_id(name) do
+      {:ok, project_id} -> project_id
+      {:error, reason} -> raise "Failed to get project_id: #{reason}"
+    end
+  end
 end

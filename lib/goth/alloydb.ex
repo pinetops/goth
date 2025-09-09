@@ -107,40 +107,6 @@ defmodule Goth.AlloyDB do
   @cert_lifetime_hours 24
   @refresh_before_minutes 60
 
-  @doc """
-  Gets the project_id from Goth server credentials.
-  
-  ## Examples
-  
-      {:ok, project_id} = Goth.AlloyDB.get_project_id(MyApp.Goth)
-      # => "my-project-123"
-  """
-  @spec get_project_id(atom()) :: {:ok, String.t()} | {:error, term()}
-  def get_project_id(goth_name) do
-    # Try metadata service first (most reliable on GCP)
-    case get_project_id_from_metadata() do
-      {:ok, project_id} -> {:ok, project_id}
-      {:error, _} ->
-        # Fall back to trying Goth server state
-        try do
-          state = :sys.get_state(goth_name)
-          extract_project_id_from_state(state)
-        rescue
-          _ -> {:error, "Could not determine project_id from metadata service or Goth server"}
-        end
-    end
-  end
-
-  @doc """
-  Gets project_id and raises on error.
-  """
-  @spec get_project_id!(atom()) :: String.t()
-  def get_project_id!(goth_name) do
-    case get_project_id(goth_name) do
-      {:ok, project_id} -> project_id
-      {:error, reason} -> raise "Failed to get project_id: #{inspect(reason)}"
-    end
-  end
 
   @doc """
   Fetches an OAuth2 access token from a Goth server.
@@ -453,7 +419,7 @@ defmodule Goth.AlloyDB do
     
     # Auto-derive project_id if not provided
     ssl_opts = case Keyword.get(opts, :project_id) do
-      nil -> Keyword.put(opts, :project_id, get_project_id!(goth_name))
+      nil -> Keyword.put(opts, :project_id, Goth.get_project_id!(goth_name))
       _ -> opts
     end
     
@@ -813,7 +779,7 @@ defmodule Goth.AlloyDB do
           nil ->
             # Try to get from Goth server (only works for project_id)
             if key == :project_id do
-              case get_project_id(goth_server) do
+              case Goth.get_project_id(goth_server) do
                 {:ok, project_id} -> project_id
                 {:error, _} -> raise "Missing required option :#{key}, env var #{env_var}, and could not derive from Goth server"
               end
@@ -827,35 +793,4 @@ defmodule Goth.AlloyDB do
     end
   end
 
-  # Helper functions for project_id extraction
-
-  defp extract_project_id_from_state(state) do
-    # Try to extract project_id from Goth server state
-    # This depends on Goth's internal structure which may change
-    try do
-      case state do
-        %{source: {:service_account, credentials}} when is_map(credentials) ->
-          case Map.get(credentials, "project_id") do
-            nil -> :not_found
-            project_id -> {:ok, project_id}
-          end
-        _ ->
-          :not_found
-      end
-    rescue
-      _ -> :not_found
-    end
-  end
-
-  defp get_project_id_from_metadata do
-    # Try to get project_id from GCP metadata service
-    case HTTPoison.get("http://metadata.google.internal/computeMetadata/v1/project/project-id", 
-                       [{"Metadata-Flavor", "Google"}], 
-                       [timeout: 5000]) do
-      {:ok, %{status_code: 200, body: project_id}} ->
-        {:ok, String.trim(project_id)}
-      _ ->
-        {:error, "Could not determine project_id from Goth or metadata service"}
-    end
-  end
 end
