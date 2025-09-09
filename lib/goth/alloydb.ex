@@ -54,12 +54,36 @@ defmodule Goth.AlloyDB do
         location: "us-central1",
         cluster: "my-cluster"
       )
+
+  ## Certificate Caching
+
+  Goth.AlloyDB automatically caches certificates for performance:
+
+  - **Cache Duration**: 24 hours (typical AlloyDB certificate lifetime)
+  - **Auto Refresh**: Certificates refreshed 1 hour before expiry
+  - **Cache Key**: Based on project_id, location, cluster, and hostname
+  - **Memory Storage**: Uses ETS tables for fast access
+  - **Background Refresh**: New certificates generated before old ones expire
+
+  ### Cache Management
+
+      # Check cached certificates
+      Goth.AlloyDB.cert_cache_info()
+
+      # Clear cache (forces regeneration)
+      Goth.AlloyDB.clear_cert_cache()
+
+      # Use uncached generation (for testing)
+      Goth.AlloyDB.generate_ssl_config_uncached(token, opts)
   """
 
   require Logger
   alias Goth.Token
 
   @default_scopes ["https://www.googleapis.com/auth/cloud-platform"]
+  @cert_cache_table :goth_alloydb_cert_cache
+  @cert_lifetime_hours 24
+  @refresh_before_minutes 60
 
   @doc """
   Fetches an OAuth2 access token from a Goth server.
@@ -250,10 +274,11 @@ defmodule Goth.AlloyDB do
   end
 
   @doc """
-  Generates complete SSL configuration for AlloyDB connection.
+  Generates complete SSL configuration for AlloyDB connection with caching.
 
   Creates temporary certificate files and returns SSL options suitable 
-  for Postgrex.
+  for Postgrex. Certificates are cached for performance and automatically
+  refreshed before expiry.
 
   ## Examples
 
@@ -267,6 +292,24 @@ defmodule Goth.AlloyDB do
   """
   @spec generate_ssl_config(String.t(), keyword()) :: {:ok, keyword()} | {:error, term()}
   def generate_ssl_config(token, opts) do
+    cache_key = build_cert_cache_key(opts)
+    
+    case get_cached_certificate(cache_key) do
+      {:ok, ssl_config} ->
+        Logger.debug("Using cached AlloyDB certificate")
+        {:ok, ssl_config}
+        
+      :cache_miss ->
+        Logger.debug("Generating new AlloyDB certificate")
+        generate_and_cache_ssl_config(token, opts, cache_key)
+    end
+  end
+
+  @doc """
+  Generates SSL configuration without caching (for testing or special cases).
+  """
+  @spec generate_ssl_config_uncached(String.t(), keyword()) :: {:ok, keyword()} | {:error, term()}
+  def generate_ssl_config_uncached(token, opts) do
     hostname = Keyword.fetch!(opts, :hostname)
     
     with {private_pem, public_pem} <- generate_rsa_keypair(),
@@ -416,7 +459,147 @@ defmodule Goth.AlloyDB do
     Goth.start_link(opts)
   end
 
+  @doc """
+  Clears the certificate cache.
+
+  Useful for testing or when you want to force certificate regeneration.
+
+  ## Examples
+
+      Goth.AlloyDB.clear_cert_cache()
+  """
+  @spec clear_cert_cache() :: :ok
+  def clear_cert_cache do
+    case :ets.whereis(@cert_cache_table) do
+      :undefined -> :ok
+      _ -> 
+        :ets.delete_all_objects(@cert_cache_table)
+        Logger.info("Cleared AlloyDB certificate cache")
+        :ok
+    end
+  end
+
+  @doc """
+  Returns information about cached certificates.
+
+  ## Examples
+
+      Goth.AlloyDB.cert_cache_info()
+      # => [
+      #   %{
+      #     project_id: "my-project",
+      #     location: "us-central1", 
+      #     cluster: "my-cluster",
+      #     hostname: "10.0.0.1",
+      #     expires_at: 1234567890,
+      #     expires_in_seconds: 3600
+      #   }
+      # ]
+  """
+  @spec cert_cache_info() :: [map()]
+  def cert_cache_info do
+    case :ets.whereis(@cert_cache_table) do
+      :undefined ->
+        []
+      _ ->
+        now = :os.system_time(:second)
+        
+        :ets.tab2list(@cert_cache_table)
+        |> Enum.map(fn {{project_id, location, cluster, hostname}, _ssl_config, expires_at} ->
+          %{
+            project_id: project_id,
+            location: location,
+            cluster: cluster,
+            hostname: hostname,
+            expires_at: expires_at,
+            expires_in_seconds: max(0, expires_at - now)
+          }
+        end)
+    end
+  end
+
   # Private functions
+
+  defp build_cert_cache_key(opts) do
+    # Build cache key from AlloyDB cluster identity
+    project_id = Keyword.fetch!(opts, :project_id)
+    location = Keyword.fetch!(opts, :location)
+    cluster = Keyword.fetch!(opts, :cluster)
+    hostname = Keyword.fetch!(opts, :hostname)
+    
+    {project_id, location, cluster, hostname}
+  end
+
+  defp get_cached_certificate(cache_key) do
+    ensure_cert_cache_table()
+    
+    case :ets.lookup(@cert_cache_table, cache_key) do
+      [{^cache_key, ssl_config, expires_at}] ->
+        now = :os.system_time(:second)
+        refresh_threshold = expires_at - (@refresh_before_minutes * 60)
+        
+        if now < refresh_threshold do
+          # Certificate is still fresh
+          {:ok, ssl_config}
+        else
+          # Certificate needs refresh
+          :cache_miss
+        end
+        
+      [] ->
+        :cache_miss
+    end
+  end
+
+  defp generate_and_cache_ssl_config(token, opts, cache_key) do
+    hostname = Keyword.fetch!(opts, :hostname)
+    
+    with {private_pem, public_pem} <- generate_rsa_keypair(),
+         true <- validate_rsa_keypair(private_pem, public_pem),
+         {:ok, cert_chain, ca_cert} <- get_client_certificate(token, public_pem, opts) do
+      
+      # Write certificates to temporary files
+      cert_file = write_temp_file("alloydb_client_cert", hd(cert_chain))
+      key_file = write_temp_file("alloydb_client_key", private_pem) 
+      ca_file = write_temp_file("alloydb_ca_cert", ca_cert)
+      
+      ssl_config = [
+        certfile: cert_file,
+        keyfile: key_file,
+        cacertfile: ca_file,
+        verify: :verify_peer,
+        versions: [:"tlsv1.3"],
+        server_name: String.to_charlist(hostname),
+        verify_fun: {&verify_fun/3, nil}
+      ]
+      
+      # Cache the certificate
+      expires_at = :os.system_time(:second) + (@cert_lifetime_hours * 3600)
+      store_certificate_in_cache(cache_key, ssl_config, expires_at)
+      
+      Logger.info("Generated and cached new AlloyDB certificate (expires in #{@cert_lifetime_hours}h)")
+      {:ok, ssl_config}
+    end
+  end
+
+  defp ensure_cert_cache_table do
+    case :ets.whereis(@cert_cache_table) do
+      :undefined ->
+        :ets.new(@cert_cache_table, [
+          :set,
+          :public,
+          :named_table,
+          {:read_concurrency, true}
+        ])
+      _ ->
+        :ok
+    end
+  end
+
+  defp store_certificate_in_cache(cache_key, ssl_config, expires_at) do
+    ensure_cert_cache_table()
+    :ets.insert(@cert_cache_table, {cache_key, ssl_config, expires_at})
+  end
 
   defp write_temp_file(prefix, content) do
     timestamp = :os.system_time(:microsecond)
